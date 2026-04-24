@@ -1,0 +1,36 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:      # lets you trigger it manually from GitHub UI
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --windowed --name OkeyCardGame `
+            --add-data "okey_logic;okey_logic" `
+            --add-data "okey_gui;okey_gui" `
+            main.py
+
+      - name: Upload EXE as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OkeyCardGame-Windows
+          path: dist/OkeyCardGame.exe
+          retention-days: 30

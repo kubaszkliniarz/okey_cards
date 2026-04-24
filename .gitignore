@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+env/
+activate/
+list/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+Thumbs.db
+
+# PyInstaller output (CI builds artifacts separately)
+dist/
+build/

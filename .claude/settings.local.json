@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(python main.py)",
+      "Bash(python3 main.py)",
+      "mcp__Claude_in_Chrome__computer",
+      "Bash(pkill -f \"python3 main.py\")",
+      "Bash(chmod +x /Users/jakubszkliniarz/repos/okay_cards/build_mac.sh)"
+    ]
+  }
+}
