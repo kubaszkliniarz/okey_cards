@@ -15,7 +15,7 @@ Terminology
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Tuple, Set
+from typing import List, Optional, Tuple, Set
 
 from okey_logic.game import Card, COLORS, NUMBERS, score_combo
 
@@ -123,11 +123,40 @@ class SolverSession:
         self.round += 1
         return gone
 
+    def discard_one(self, card: Card) -> bool:
+        """
+        Discard a single hand card (permanently gone from the deck).  Used when
+        the user discards one card at a time in the real game and wants the
+        solver to update EV before they enter the replacement.  Returns True
+        on success.
+        """
+        if card not in self.hand:
+            return False
+        self.hand.remove(card)
+        self.discarded.append(card)
+        return True
+
+    def undo_last_discard(self) -> Optional[Card]:
+        """
+        Return the most recently discarded card to the hand.  Returns the
+        card on success, or None if there's nothing to undo or the hand is
+        already at capacity.  Discarding is the only otherwise-irreversible
+        action; this restores it.
+        """
+        if not self.discarded:
+            return None
+        if self.hand_full:
+            return None
+        card = self.discarded.pop()
+        self.hand.append(card)
+        return card
+
     def submit_combo(self) -> Tuple[bool, int, str]:
         """
         Validate and score the current stack (must have exactly 3 cards).
-        On success → clears stack, records score.
-        On failure → stack unchanged.
+        On success → clears stack, records the combo in `scored`.  Hand is
+        left untouched — discards must be explicit.  Scored cards are not
+        added to `discarded`; `seen` already counts them via `scored`.
         Returns (success, points, description).
         """
         if len(self.stack) != MAX_STACK:
@@ -135,7 +164,6 @@ class SolverSession:
         valid, pts, desc = score_combo(self.stack)
         if valid:
             self.scored.append(ScoredCombo(list(self.stack), pts, desc))
-            self.discarded.extend(self.stack)   # scored cards also leave the pool
             self.stack.clear()
             self.total_score += pts
             return True, pts, desc

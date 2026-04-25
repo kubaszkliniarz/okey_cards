@@ -20,7 +20,13 @@ Layout
 """
 
 from __future__ import annotations
+import datetime
+import os
+import random
+import tempfile
+import threading
 import tkinter as tk
+import urllib.request
 from tkinter import font as tkfont
 from typing import Dict, List, Optional, Any
 
@@ -29,12 +35,15 @@ from okey_logic.session import SolverSession, ALL_CARDS
 from okey_logic.solver import solve
 from okey_gui.widgets import (
     BG, PANEL, ACCENT, SUCCESS, WARNING, MUTED, FG, HL_RING,
-    CardWidget, ActionButton,
+    BTN_NEUTRAL, BTN_SUCCESS, BTN_DANGER,
+    CardWidget, MiniCard, ActionButton,
 )
 
 PICKER_CARD_W = 52
 PICKER_CARD_H = 72
 CARD_PAD      = 3
+SOLVER_BG     = "#0d0d1f"
+REC_BG        = "#1a1e35"
 
 # card state → visual style
 STATE_COLORS = {
@@ -129,13 +138,19 @@ class SlotCard(tk.Canvas):
     W, H = 64, 90
 
     def __init__(self, parent, card: Optional[Card], on_click=None,
-                 border_color="#333355", **kw):
+                 on_right_click=None, border_color="#333355", **kw):
         super().__init__(parent, width=self.W, height=self.H,
                          bg=PANEL, highlightthickness=0,
                          cursor="hand2" if (card and on_click) else "arrow", **kw)
         self.card = card
         if on_click and card:
             self.bind("<Button-1>", lambda _e: on_click(card))
+        if on_right_click and card:
+            # On macOS a two-finger tap or Control-click usually fires
+            # <Button-2>; on Linux/Windows it's <Button-3>.  Bind both plus
+            # explicit Ctrl-click so discard works everywhere.
+            for seq in ("<Button-2>", "<Button-3>", "<Control-Button-1>"):
+                self.bind(seq, lambda _e, c=card: on_right_click(c))
         self._border = border_color
         self._draw()
 
@@ -173,9 +188,11 @@ class OkeyApp(tk.Tk):
         self._picker: Dict[Card, PickerCard] = {}
         self._solve_result: Optional[Dict[str, Any]] = None
         self._highlighted: List[Card] = []
+        self._game_over_overlay: Optional[tk.Frame] = None
 
         self._build_ui()
         self._refresh()
+        self._easter_egg = _KremuwkaEgg(self)
 
     # ─────────────────────────────────────────────────────────────────────────
     # UI construction
@@ -190,7 +207,7 @@ class OkeyApp(tk.Tk):
         tk.Label(title_row, text=" Solver", font=("Arial", 20),
                  bg=BG, fg=FG).pack(side="left")
         ActionButton(title_row, "New Game", self._new_game,
-                     color="#333355").pack(side="right")
+                     color=BTN_NEUTRAL).pack(side="right")
 
         # ── Stats ──────────────────────────────────────────────────────────────
         stats = tk.Frame(self, bg=BG)
@@ -209,7 +226,7 @@ class OkeyApp(tk.Tk):
 
         left  = tk.Frame(body, bg=BG)
         left.pack(side="left", fill="both", expand=True)
-        right = tk.Frame(body, bg=PANEL, width=280)
+        right = tk.Frame(body, bg=PANEL, width=340)
         right.pack(side="right", fill="y", padx=(16, 0))
         right.pack_propagate(False)
 
@@ -222,10 +239,10 @@ class OkeyApp(tk.Tk):
         stack_btns = tk.Frame(stack_outer, bg=BG)
         stack_btns.pack(side="left", padx=(10, 0))
         self.btn_submit = ActionButton(stack_btns, "✓ Submit Combo",
-                                       self._submit_combo, color="#1a5c1a")
+                                       self._submit_combo, color=BTN_SUCCESS)
         self.btn_submit.pack(anchor="w", pady=(0, 4))
         ActionButton(stack_btns, "↩ Clear Stack",
-                     self._clear_stack, color="#333355").pack(anchor="w")
+                     self._clear_stack, color=BTN_NEUTRAL).pack(anchor="w")
         self.stack_status = tk.Label(left, text="", font=("Arial", 10),
                                      bg=BG, fg=MUTED)
         self.stack_status.pack(anchor="w", pady=(0, 4))
@@ -233,14 +250,25 @@ class OkeyApp(tk.Tk):
         _sep(left)
 
         # ── Hand ───────────────────────────────────────────────────────────────
-        self._section(left, "CURRENT HAND  —  click a hand card to move it to the stack")
+        self._section(
+            left,
+            "CURRENT HAND  —  left-click: move to stack   "
+            "·   right-click (or ⌃-click): discard just that card",
+        )
         hand_outer = tk.Frame(left, bg=BG)
         hand_outer.pack(anchor="w", pady=(0, 6))
         self.hand_frame = tk.Frame(hand_outer, bg=PANEL, padx=8, pady=6)
         self.hand_frame.pack(side="left")
-        ActionButton(hand_outer, "↺ Discard Hand & Draw",
-                     self._discard_hand, color="#5c1a1a").pack(
-            side="left", padx=(12, 0))
+
+        hand_btns = tk.Frame(hand_outer, bg=BG)
+        hand_btns.pack(side="left", padx=(12, 0))
+        ActionButton(hand_btns, "↺ Discard Hand & Draw",
+                     self._discard_hand, color=BTN_DANGER).pack(anchor="w")
+        self.btn_undo = ActionButton(
+            hand_btns, "↶ Undo Last Discard",
+            self._undo_discard, color=BTN_NEUTRAL,
+        )
+        self.btn_undo.pack(anchor="w", pady=(4, 0))
 
         _sep(left)
 
@@ -279,6 +307,16 @@ class OkeyApp(tk.Tk):
         self.log_text.tag_configure("good", foreground=SUCCESS)
         self.log_text.tag_configure("warn", foreground=WARNING)
         self.log_text.tag_configure("head", foreground=ACCENT)
+        # Colour tags for individual cards in the log
+        self.log_text.tag_configure("card_yellow",
+                                    foreground=COLOR_HEX["yellow"],
+                                    font=("Courier", 8, "bold"))
+        self.log_text.tag_configure("card_red",
+                                    foreground=COLOR_HEX["red"],
+                                    font=("Courier", 8, "bold"))
+        self.log_text.tag_configure("card_blue",
+                                    foreground="#5b8eff",   # lighter than card face for legibility on dark
+                                    font=("Courier", 8, "bold"))
 
         # ── Solver panel ───────────────────────────────────────────────────────
         tk.Label(right, text="🧠  AI ANALYSIS", font=("Arial", 13, "bold"),
@@ -288,16 +326,49 @@ class OkeyApp(tk.Tk):
         self._auto_var = tk.BooleanVar(value=True)
         tk.Checkbutton(right, text="Auto-analyse on changes",
                        variable=self._auto_var,
-                       bg=PANEL, fg=MUTED, activebackground=PANEL,
+                       bg=PANEL, fg=FG, activebackground=PANEL,
+                       activeforeground=FG,
                        selectcolor=BG, font=("Arial", 9),
                        command=lambda: None).pack(padx=10, anchor="w")
-        self.solver_text = tk.Text(
-            right, bg="#0d0d1f", fg=FG, font=("Courier", 9),
-            wrap="word", state="disabled", relief="flat",
-            padx=8, pady=8, spacing1=1,
+
+        # Scrollable container for the analysis content (a Canvas wrapping a Frame)
+        wrap = tk.Frame(right, bg=SOLVER_BG)
+        wrap.pack(fill="both", expand=True, padx=6, pady=(4, 10))
+        self.solver_canvas = tk.Canvas(
+            wrap, bg=SOLVER_BG, highlightthickness=0,
         )
-        self.solver_text.pack(fill="both", expand=True, padx=6, pady=(4, 10))
-        _configure_tags(self.solver_text)
+        sb = tk.Scrollbar(wrap, orient="vertical",
+                          command=self.solver_canvas.yview)
+        self.solver_canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.solver_canvas.pack(side="left", fill="both", expand=True)
+
+        self.solver_frame = tk.Frame(self.solver_canvas, bg=SOLVER_BG)
+        self._solver_win = self.solver_canvas.create_window(
+            (0, 0), window=self.solver_frame, anchor="nw",
+        )
+        self.solver_frame.bind(
+            "<Configure>",
+            lambda _e: self.solver_canvas.configure(
+                scrollregion=self.solver_canvas.bbox("all")
+            ),
+        )
+        self.solver_canvas.bind(
+            "<Configure>",
+            lambda e: self.solver_canvas.itemconfigure(
+                self._solver_win, width=e.width
+            ),
+        )
+        self.solver_canvas.bind(
+            "<Enter>",
+            lambda _e: self.solver_canvas.bind_all(
+                "<MouseWheel>", self._on_solver_wheel
+            ),
+        )
+        self.solver_canvas.bind(
+            "<Leave>",
+            lambda _e: self.solver_canvas.unbind_all("<MouseWheel>"),
+        )
 
         # ── Status bar ─────────────────────────────────────────────────────────
         self.status_bar = tk.Label(
@@ -345,6 +416,7 @@ class OkeyApp(tk.Tk):
             border = HL_RING if hl else SUCCESS
             SlotCard(self.hand_frame, card,
                      on_click=self._hand_card_clicked,
+                     on_right_click=self._hand_card_discard_one,
                      border_color=border).pack(side="left", padx=4)
         for _ in range(self.session.hand_capacity - len(self.session.hand)):
             SlotCard(self.hand_frame, None).pack(side="left", padx=4)
@@ -362,8 +434,10 @@ class OkeyApp(tk.Tk):
                 widget.set_state("stack")
             elif card in hand_set:
                 widget.set_state("hand")
-            elif card in disc_set or card in scored_set:
-                widget.set_state("discarded" if card in disc_set else "scored")
+            elif card in scored_set:
+                widget.set_state("scored")
+            elif card in disc_set:
+                widget.set_state("discarded")
             else:
                 widget.set_state("available")
 
@@ -378,6 +452,11 @@ class OkeyApp(tk.Tk):
     def _update_buttons(self) -> None:
         has_3 = len(self.session.stack) == 3
         self.btn_submit.config(state="normal" if has_3 else "disabled")
+        can_undo = (
+            len(self.session.discarded) > 0
+            and not self.session.hand_full
+        )
+        self.btn_undo.config(state="normal" if can_undo else "disabled")
 
     # ─────────────────────────────────────────────────────────────────────────
     # User actions
@@ -409,6 +488,23 @@ class OkeyApp(tk.Tk):
         self._highlighted = [c for c in self._highlighted if c != card]
         self._refresh()
 
+    def _hand_card_discard_one(self, card: Card) -> None:
+        """Right-click on a hand card: discard just that one, then redraw
+        recommendations.  The user then enters the replacement card via the
+        picker once they see it in the real game."""
+        if not self.session.discard_one(card):
+            return
+        self._highlighted = [c for c in self._highlighted if c != card]
+        self._solve_result = None
+        self._log_cards("Discarded: ", [card])
+        self._status(
+            f"Discarded {card}.  Enter the card you drew to replace it.",
+            FG,
+        )
+        self._refresh()
+        if self.session.cards_seen == 24:
+            self._show_game_over()
+
     def _stack_card_clicked(self, card: Card) -> None:
         err = self.session.return_from_stack(card)
         if err:
@@ -439,11 +535,11 @@ class OkeyApp(tk.Tk):
             self._status("Hand is empty — use the picker to enter your new cards.", WARNING)
             return
         gone = self.session.discard_hand()
-        gone_str = "  ".join(str(c) for c in gone)
-        self._log(f"Discarded: {gone_str}", "warn")
+        self._log_cards("Discarded: ", gone)
         capacity = self.session.hand_capacity
         self._status(
-            f"Hand discarded.  Now enter the {capacity} new card(s) you drew "
+            f"Hand discarded ({len(gone)} card(s)).  "
+            f"Now enter the new card(s) you drew "
             f"(stack has {len(self.session.stack)}).",
             FG,
         )
@@ -452,6 +548,19 @@ class OkeyApp(tk.Tk):
         self._refresh()
         if self.session.cards_seen == 24:
             self._show_game_over()
+
+    def _undo_discard(self) -> None:
+        card = self.session.undo_last_discard()
+        if card is None:
+            if self.session.hand_full:
+                self._status("Hand is already full — can't undo.", WARNING)
+            else:
+                self._status("Nothing to undo.", MUTED)
+            return
+        self._log_cards("Undid discard: ", [card], tag="good")
+        self._status(f"Restored {card} to hand.", FG)
+        self._solve_result = None
+        self._refresh()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Solver
@@ -471,142 +580,321 @@ class OkeyApp(tk.Tk):
         self._draw_hand()
         self._write_solver(result)
 
+    # ── Solver panel rendering (graphical) ───────────────────────────────────
+
+    def _on_solver_wheel(self, event: tk.Event) -> None:
+        self.solver_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _card_row(
+        self,
+        parent: tk.Widget,
+        cards: List[Card],
+        highlight: bool = False,
+        dim: bool = False,
+        bg: Optional[str] = None,
+    ) -> tk.Frame:
+        bg_col = bg or parent.cget("bg")
+        row = tk.Frame(parent, bg=bg_col)
+        row.pack(anchor="w", pady=2)
+        for c in cards:
+            MiniCard(row, c, highlight=highlight, dim=dim,
+                     bg=bg_col).pack(side="left", padx=2)
+        return row
+
     def _write_solver(self, r: Dict[str, Any]) -> None:
-        t = self.solver_text
-        t.config(state="normal")
-        t.delete("1.0", "end")
+        f = self.solver_frame
+        _clear(f)
 
-        def w(text: str, tag: str = "") -> None:
-            t.insert("end", text, tag)
-
+        rec = r.get("recommendation", {})
+        action = rec.get("action", "")
         deck_size = len(self.session.remaining_deck)
 
-        # ── Valid combos ──────────────────────────────────────────────────────
-        w("═══ VALID COMBOS NOW ═══\n", "hdr")
+        # ── 1. RECOMMENDATION (top) ───────────────────────────────────────────
+        rec_frame = tk.Frame(f, bg=REC_BG, bd=2,
+                             highlightbackground=ACCENT,
+                             highlightthickness=2)
+        rec_frame.pack(fill="x", pady=(4, 10), padx=4)
+        inner = tk.Frame(rec_frame, bg=REC_BG)
+        inner.pack(fill="x", padx=10, pady=8)
+
+        tk.Label(inner, text="▶  RECOMMENDATION",
+                 font=("Arial", 11, "bold"), bg=REC_BG,
+                 fg=ACCENT).pack(anchor="w")
+
+        if action == "play":
+            tk.Label(inner, text="PLAY THIS COMBO NOW",
+                     font=("Arial", 14, "bold"), bg=REC_BG,
+                     fg=SUCCESS).pack(anchor="w", pady=(4, 2))
+            self._card_row(inner, rec["cards"], highlight=True, bg=REC_BG)
+            tk.Label(inner, text=f"+{rec['score']} pts guaranteed",
+                     font=("Arial", 11, "bold"), bg=REC_BG,
+                     fg=SUCCESS).pack(anchor="w", pady=(4, 0))
+            desc = rec.get("desc", "").split("→")[0].strip()
+            if desc:
+                tk.Label(inner, text=desc,
+                         font=("Arial", 9), bg=REC_BG,
+                         fg=MUTED, wraplength=280,
+                         justify="left").pack(anchor="w")
+
+        elif action == "keep_and_draw":
+            keep = rec.get("keep", [])
+            discard = rec.get("discard", [])
+            n_draw = rec.get("n_draw", 0)
+
+            if keep:
+                title = f"KEEP {len(keep)}, DISCARD & REDRAW {n_draw}"
+                color = HL_RING
+            else:
+                title = f"DISCARD ALL ({n_draw}), DRAW FRESH"
+                color = WARNING
+            tk.Label(inner, text=title,
+                     font=("Arial", 13, "bold"), bg=REC_BG,
+                     fg=color).pack(anchor="w", pady=(4, 2))
+
+            if keep:
+                tk.Label(inner, text="Keep:",
+                         font=("Arial", 9, "bold"), bg=REC_BG,
+                         fg=FG).pack(anchor="w", pady=(6, 1))
+                self._card_row(inner, keep, highlight=True, bg=REC_BG)
+
+            if discard:
+                tk.Label(inner, text="Discard:",
+                         font=("Arial", 9, "bold"), bg=REC_BG,
+                         fg=MUTED).pack(anchor="w", pady=(6, 1))
+                self._card_row(inner, discard, dim=True, bg=REC_BG)
+
+            need_cards = rec.get("need_cards", [])
+            if need_cards:
+                tk.Label(inner, text="Hope to draw:",
+                         font=("Arial", 9, "bold"), bg=REC_BG,
+                         fg=FG).pack(anchor="w", pady=(6, 1))
+                self._card_row(inner, need_cards[:6], bg=REC_BG)
+
+            p  = rec.get("prob", 0.0)
+            ev = rec.get("ev", 0.0)
+            stat_color = SUCCESS if p >= 0.5 else WARNING
+            tk.Label(inner,
+                     text=f"P = {p:.0%}     EV = {ev:.0f} pts",
+                     font=("Arial", 11, "bold"), bg=REC_BG,
+                     fg=stat_color).pack(anchor="w", pady=(8, 0))
+
+            if "alt_play_score" in rec:
+                tk.Label(inner,
+                         text=f"(or play now for {rec['alt_play_score']} pts guaranteed)",
+                         font=("Arial", 9, "italic"), bg=REC_BG,
+                         fg=WARNING,
+                         wraplength=280, justify="left").pack(anchor="w")
+
+        # Reasoning bullets
+        for line in rec.get("reasoning", [])[:4]:
+            tk.Label(inner, text=f"• {line}",
+                     font=("Arial", 8), bg=REC_BG, fg=MUTED,
+                     wraplength=280, justify="left").pack(anchor="w", pady=(2, 0))
+
+        # ── 2. VALID COMBOS NOW ───────────────────────────────────────────────
+        self._section_header(f, "✓  VALID COMBOS NOW")
         combos = r.get("immediate_combos", [])
         if combos:
-            for cards, pts, desc in combos[:4]:
-                w(f"  {desc}\n", "good")
-                w(f"  Cards: {[str(c) for c in cards]}\n\n", "muted")
+            for cards, pts, desc in combos[:3]:
+                sub = tk.Frame(f, bg=SOLVER_BG)
+                sub.pack(fill="x", padx=6, pady=2, anchor="w")
+                self._card_row(sub, cards, bg=SOLVER_BG)
+                label_desc = desc.split("→")[0].strip()
+                tk.Label(sub, text=f"{pts} pts  ·  {label_desc}",
+                         font=("Arial", 9, "bold"), bg=SOLVER_BG,
+                         fg=SUCCESS, wraplength=300,
+                         justify="left").pack(anchor="w", pady=(0, 2))
         else:
-            w("  None with current cards.\n\n", "muted")
+            tk.Label(f, text="  None with current cards.",
+                     font=("Arial", 9, "italic"), bg=SOLVER_BG,
+                     fg=MUTED).pack(anchor="w", padx=8, pady=(0, 4))
 
-        # ── Near combos ───────────────────────────────────────────────────────
-        w("═══ NEAR COMBOS ═══\n", "hdr")
+        # ── 3. DISCARD OPTIONS (compare by how many you throw away) ──────────
+        alt_keeps = r.get("alt_keeps", [])
+        if alt_keeps and any(k["n_draw"] > 0 for k in alt_keeps):
+            self._section_header(f, "⇄  DISCARD OPTIONS (by count)")
+            tk.Label(f,
+                     text="Raw EV is what you'd score on average. "
+                          "Adjusted EV penalises burning the deck.",
+                     font=("Arial", 8, "italic"), bg=SOLVER_BG,
+                     fg=MUTED, wraplength=310,
+                     justify="left").pack(anchor="w", padx=8, pady=(0, 4))
+            best_adj = max(k["adjusted_ev"] for k in alt_keeps)
+            for k in alt_keeps:
+                if k["n_draw"] == 0:
+                    continue
+                self._render_alt_keep(f, k, best_adj)
+
+        # ── 4. NEAR COMBOS ────────────────────────────────────────────────────
+        self._section_header(f, "◯  NEAR COMBOS (hope to draw)")
         nears = r.get("near_combos", [])
         if nears:
             for nc in nears[:4]:
-                pair_str = " + ".join(str(c) for c in nc["pair"])
-                w(f"  Keep: {pair_str}\n", "hl")
-                w(f"  Need: {nc['need_count']}× card in deck ({deck_size} left)\n")
-                w(f"  Examples: {', '.join(nc['need_examples'])}\n", "muted")
-                tag = "good" if nc["prob"] >= 0.5 else "warn"
-                w(f"  P={nc['prob']:.0%}  score={nc['best_score']}  EV={nc['ev']:.0f}\n",
-                  tag)
-                w(f"  → {nc['best_desc']}\n\n", "muted")
+                self._render_near(f, nc, deck_size)
         else:
-            w("  None.\n\n", "muted")
+            tk.Label(f, text="  None.",
+                     font=("Arial", 9, "italic"), bg=SOLVER_BG,
+                     fg=MUTED).pack(anchor="w", padx=8, pady=(0, 4))
 
-        # ── Two-pair ─────────────────────────────────────────────────────────
-        tp = r.get("two_pair")
-        if tp and tp["ev"] > 0:
-            w("═══ TWO-PAIR OPTION ═══\n", "hdr")
-            p1 = " + ".join(str(c) for c in tp["pair1"])
-            p2 = " + ".join(str(c) for c in tp["pair2"])
-            w(f"  Keep: {p1}\n", "hl")
-            w(f"  Keep: {p2}\n", "hl")
-            tag = "good" if tp["prob"] >= 0.4 else "warn"
-            w(f"  P={tp['prob']:.0%}  draw {tp['n_draw']}  EV={tp['ev']:.0f}\n\n", tag)
+        # ── 5. Baseline ───────────────────────────────────────────────────────
+        tk.Label(f,
+                 text=f"Fresh-draw baseline EV ≈ {r.get('fresh_ev', 0):.0f} pts",
+                 font=("Arial", 8, "italic"), bg=SOLVER_BG,
+                 fg=MUTED).pack(anchor="w", padx=8, pady=(8, 8))
 
-        # ── EV baseline ───────────────────────────────────────────────────────
-        w(f"Fresh draw EV ≈ {r.get('fresh_ev', 0):.0f} pts\n\n", "muted")
+        # Scroll to top after rebuild
+        self.solver_canvas.yview_moveto(0.0)
 
-        # ── Recommendation ────────────────────────────────────────────────────
-        w("═══ RECOMMENDATION ═══\n", "hdr")
-        rec = r.get("recommendation", {})
-        action = rec.get("action", "")
+    def _section_header(self, parent: tk.Widget, text: str) -> None:
+        tk.Label(parent, text=text,
+                 font=("Arial", 10, "bold"), bg=SOLVER_BG,
+                 fg=ACCENT).pack(anchor="w", padx=6, pady=(10, 2))
 
-        if action == "play":
-            w("  ✓ PLAY THESE 3 CARDS NOW\n", "good")
-            w(f"  {[str(c) for c in rec['cards']]}\n", "good")
-            w(f"  Score: {rec['score']} pts\n\n", "good")
-        elif action == "keep_and_draw":
-            w("  ↻ KEEP THIS PAIR, DISCARD THE REST\n", "hl")
-            keep_str = " + ".join(str(c) for c in rec["keep"])
-            w(f"  Keep:    {keep_str}\n", "hl")
-            if rec.get("discard"):
-                w(f"  Discard: {[str(c) for c in rec['discard']]}\n", "muted")
-            need = rec.get("need_examples", [])
-            if need:
-                w(f"  Hoping for: {', '.join(need)}\n")
-            tag = "good" if rec.get("prob", 0) >= 0.5 else "warn"
-            w(f"  P={rec.get('prob', 0):.0%}  EV={rec.get('ev', 0):.0f} pts\n\n", tag)
-            if "alt_play_score" in rec:
-                w(f"  (Alt: play now for {rec['alt_play_score']} pts guaranteed)\n\n",
-                  "warn")
-        elif action == "keep_two_pairs":
-            w("  ↻ KEEP BOTH PAIRS\n", "hl")
-            p1 = " + ".join(str(c) for c in rec["pair1"])
-            p2 = " + ".join(str(c) for c in rec["pair2"])
-            w(f"  Pair 1: {p1}\n", "hl")
-            w(f"  Pair 2: {p2}\n", "hl")
-            if rec.get("discard"):
-                w(f"  Discard: {[str(c) for c in rec['discard']]}\n", "muted")
-            tag = "good" if rec.get("prob", 0) >= 0.4 else "warn"
-            w(f"  P={rec.get('prob', 0):.0%}  EV={rec.get('ev', 0):.0f} pts\n\n", tag)
-        else:
-            w("  ↺ DISCARD ALL, DRAW FRESH\n", "warn")
-            w(f"  No profitable partial combos.  EV≈{rec.get('ev', 0):.0f}\n\n", "muted")
+    def _render_alt_keep(self, parent: tk.Widget, k: Dict[str, Any],
+                         best_adj: float) -> None:
+        """One row in the DISCARD OPTIONS panel — keep/discard layout + EV."""
+        n_draw = k["n_draw"]
+        is_best = abs(k["adjusted_ev"] - best_adj) < 0.5
 
-        for line in rec.get("reasoning", []):
-            w(f"  • {line}\n", "muted")
+        sub = tk.Frame(parent, bg=SOLVER_BG)
+        sub.pack(fill="x", padx=6, pady=3, anchor="w")
 
-        t.config(state="disabled")
+        head_color = SUCCESS if is_best else FG
+        head = f"Discard {n_draw}"
+        if is_best:
+            head += "   ← BEST"
+        tk.Label(sub, text=head,
+                 font=("Arial", 9, "bold"), bg=SOLVER_BG,
+                 fg=head_color).pack(anchor="w")
+
+        row = tk.Frame(sub, bg=SOLVER_BG)
+        row.pack(anchor="w", pady=1)
+        if k["keep"]:
+            tk.Label(row, text="keep", font=("Arial", 8),
+                     bg=SOLVER_BG, fg=MUTED).pack(side="left", padx=(0, 2))
+            for c in k["keep"]:
+                MiniCard(row, c, highlight=is_best,
+                         bg=SOLVER_BG).pack(side="left", padx=1)
+        if k["discard"]:
+            tk.Label(row, text="  drop", font=("Arial", 8),
+                     bg=SOLVER_BG, fg=MUTED).pack(side="left", padx=(6, 2))
+            for c in k["discard"]:
+                MiniCard(row, c, dim=True,
+                         bg=SOLVER_BG).pack(side="left", padx=1)
+
+        tk.Label(sub,
+                 text=(f"raw EV {k['ev']:.0f}   "
+                       f"adj {k['adjusted_ev']:.0f}   "
+                       f"P={k['prob']:.0%}"),
+                 font=("Arial", 8), bg=SOLVER_BG,
+                 fg=SUCCESS if is_best else MUTED).pack(anchor="w")
+
+    def _render_near(self, parent: tk.Widget, nc: Dict[str, Any],
+                     deck_size: int) -> None:
+        sub = tk.Frame(parent, bg=SOLVER_BG)
+        sub.pack(fill="x", padx=6, pady=3, anchor="w")
+
+        line = tk.Frame(sub, bg=SOLVER_BG)
+        line.pack(anchor="w")
+        for c in nc["pair"]:
+            MiniCard(line, c, highlight=True,
+                     bg=SOLVER_BG).pack(side="left", padx=2)
+        tk.Label(line, text="+", font=("Arial", 14, "bold"),
+                 bg=SOLVER_BG, fg=MUTED).pack(side="left", padx=4)
+        need_cards = nc.get("need_cards", [])
+        for c in need_cards[:3]:
+            MiniCard(line, c, bg=SOLVER_BG).pack(side="left", padx=2)
+        extra = len(need_cards) - 3
+        if extra > 0:
+            tk.Label(line, text=f"(+{extra} more)",
+                     font=("Arial", 8), bg=SOLVER_BG,
+                     fg=MUTED).pack(side="left", padx=4)
+
+        p = nc["prob"]
+        color = SUCCESS if p >= 0.5 else WARNING
+        tk.Label(sub,
+                 text=(f"P = {p:.0%}   "
+                       f"best {nc['best_score']}   "
+                       f"EV {nc['ev']:.0f}   "
+                       f"({nc['need_count']} of {deck_size} left)"),
+                 font=("Arial", 9), bg=SOLVER_BG,
+                 fg=color).pack(anchor="w", pady=(1, 0))
 
     def _write_solver_idle(self) -> None:
-        t = self.solver_text
-        t.config(state="normal")
-        t.delete("1.0", "end")
-        t.insert("end", "Enter cards using the picker\nto see analysis here.", "muted")
-        t.config(state="disabled")
+        _clear(self.solver_frame)
+        tk.Label(self.solver_frame,
+                 text="Enter cards using the picker\nto see analysis here.",
+                 font=("Arial", 9), bg=SOLVER_BG, fg=MUTED,
+                 justify="left").pack(padx=16, pady=20, anchor="w")
 
     # ─────────────────────────────────────────────────────────────────────────
     # End game (in-window, no popup)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _show_game_over(self) -> None:
+        # Guard: only one overlay at a time
+        if self._game_over_overlay is not None:
+            return
+
         score  = self.session.total_score
         combos = len(self.session.scored)
         tier   = "GOLD 🥇" if score >= 400 else "SILVER 🥈" if score >= 300 else "BRONZE 🥉"
 
-        # Overlay frame on top of everything
-        overlay = tk.Frame(self, bg="#0a0a1e", bd=2, relief="ridge")
-        overlay.place(relx=0.5, rely=0.5, anchor="center")
+        # Full-window dimming scrim
+        scrim = tk.Frame(self, bg="#000000")
+        scrim.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._game_over_overlay = scrim
 
-        tk.Label(overlay, text="GAME OVER", font=("Arial", 22, "bold"),
-                 bg="#0a0a1e", fg=ACCENT, pady=10).pack()
-        tk.Label(overlay, text=f"Final Score:  {score} pts",
+        # Centered card inside the scrim
+        card = tk.Frame(scrim, bg="#0a0a1e", bd=2, relief="ridge",
+                        highlightbackground=ACCENT, highlightthickness=2)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(card, text="GAME OVER", font=("Arial", 22, "bold"),
+                 bg="#0a0a1e", fg=ACCENT, padx=40, pady=10).pack()
+        tk.Label(card, text=f"Final Score:  {score} pts",
                  font=("Arial", 14), bg="#0a0a1e", fg=FG).pack(pady=(0, 4))
-        tk.Label(overlay, text=f"Combos Made:  {combos}",
+        tk.Label(card, text=f"Combos Made:  {combos}",
                  font=("Arial", 12), bg="#0a0a1e", fg=MUTED).pack()
-        tk.Label(overlay, text=f"Tier:  {tier}",
+        tk.Label(card, text=f"Tier:  {tier}",
                  font=("Arial", 14, "bold"), bg="#0a0a1e", fg=SUCCESS,
                  pady=8).pack()
 
-        def _new():
-            overlay.destroy()
+        btns = tk.Frame(card, bg="#0a0a1e")
+        btns.pack(padx=20, pady=(8, 16))
+
+        def _play_again():
+            self._dismiss_game_over()
             self._new_game()
 
-        ActionButton(overlay, "Play Again", _new, color=ACCENT).pack(
-            padx=20, pady=(8, 16))
+        def _close():
+            self._dismiss_game_over()
+
+        ActionButton(btns, "Play Again", _play_again, color=BTN_SUCCESS).pack(
+            side="left", padx=4)
+        ActionButton(btns, "Dismiss", _close, color=BTN_NEUTRAL).pack(
+            side="left", padx=4)
+
+        # Ensure overlay is on top of everything
+        scrim.lift()
+        scrim.focus_set()
+        # Also dismiss on Esc
+        self.bind("<Escape>", lambda _e: self._dismiss_game_over())
 
         self._log(f"Game over! Score: {score}  Tier: {tier}", "head")
+
+    def _dismiss_game_over(self) -> None:
+        if self._game_over_overlay is not None:
+            self._game_over_overlay.destroy()
+            self._game_over_overlay = None
+            self.unbind("<Escape>")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Utilities
     # ─────────────────────────────────────────────────────────────────────────
 
     def _new_game(self) -> None:
+        self._dismiss_game_over()
         self.session.reset()
         self._highlighted.clear()
         self._solve_result = None
@@ -624,10 +912,21 @@ class OkeyApp(tk.Tk):
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
+    def _log_cards(self, prefix: str, cards: List[Card],
+                   tag: str = "warn") -> None:
+        """Append a log line where each card is rendered in its own colour."""
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", prefix, tag)
+        for i, c in enumerate(cards):
+            if i:
+                self.log_text.insert("end", " ", tag)
+            self.log_text.insert("end", str(c), f"card_{c.color}")
+        self.log_text.insert("end", "\n", tag)
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
     def _clear_solver(self) -> None:
-        self.solver_text.config(state="normal")
-        self.solver_text.delete("1.0", "end")
-        self.solver_text.config(state="disabled")
+        _clear(self.solver_frame)
 
     @staticmethod
     def _stat(parent: tk.Frame, text: str, color: str = FG) -> tk.Label:
@@ -652,14 +951,6 @@ def _sep(parent: tk.Widget) -> None:
     tk.Frame(parent, bg="#2a2a44", height=1).pack(fill="x", pady=4)
 
 
-def _configure_tags(t: tk.Text) -> None:
-    t.tag_configure("hdr",  foreground=ACCENT,   font=("Courier", 9, "bold"))
-    t.tag_configure("good", foreground=SUCCESS)
-    t.tag_configure("warn", foreground=WARNING)
-    t.tag_configure("muted",foreground=MUTED)
-    t.tag_configure("hl",   foreground=HL_RING)
-
-
 def _highlight_from(result: Dict[str, Any]) -> List[Card]:
     rec    = result.get("recommendation", {})
     action = rec.get("action", "")
@@ -667,6 +958,124 @@ def _highlight_from(result: Dict[str, Any]) -> List[Card]:
         return list(rec.get("cards", []))
     if action == "keep_and_draw":
         return list(rec.get("keep", []))
-    if action == "keep_two_pairs":
-        return rec.get("pair1", []) + rec.get("pair2", [])
     return []
+
+
+# ── Easter egg ────────────────────────────────────────────────────────────────
+
+class _KremuwkaEgg:
+    """
+    Fetches a GIF once, then shows a popup:
+      • once at a random moment 5–15 min after launch
+      • always when the local clock hits 21:37 (once per day)
+    Gracefully degrades to a text-only popup if the download or GIF decode fails.
+    """
+
+    GIF_URL = (
+        "https://images.steamusercontent.com/ugc/544154344545956752/"
+        "125260318A6E3AC2B729722D743E1C31C6DBD111/"
+        "?imw=5000&imh=5000&ima=fit&impolicy=Letterbox"
+        "&imcolor=%23000000&letterbox=false"
+    )
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.gif_path: Optional[str] = None
+        self._random_fired = False
+        self._last_daily_key: Optional[str] = None
+
+        threading.Thread(target=self._download, daemon=True).start()
+
+        delay_ms = int(random.uniform(5 * 60, 15 * 60) * 1000)
+        root.after(delay_ms, self._random_fire)
+        root.after(30_000, self._tick_daily)
+
+    def _download(self) -> None:
+        try:
+            req = urllib.request.Request(
+                self.GIF_URL,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = resp.read()
+            if not data:
+                return
+            tmp = tempfile.NamedTemporaryFile(suffix=".gif", delete=False)
+            tmp.write(data)
+            tmp.close()
+            self.gif_path = tmp.name
+        except Exception:
+            pass
+
+    def _random_fire(self) -> None:
+        if not self._random_fired:
+            self._random_fired = True
+            self._show()
+
+    def _tick_daily(self) -> None:
+        try:
+            now = datetime.datetime.now()
+            if now.hour == 21 and now.minute == 37:
+                key = now.strftime("%Y-%m-%d")
+                if self._last_daily_key != key:
+                    self._last_daily_key = key
+                    self._show()
+        finally:
+            self.root.after(30_000, self._tick_daily)
+
+    def _show(self) -> None:
+        try:
+            top = tk.Toplevel(self.root)
+        except tk.TclError:
+            return
+        top.title("INSERT KREMUWKA")
+        top.configure(bg="#000000")
+        top.resizable(False, False)
+
+        tk.Label(top, text="INSERT KREMUWKA",
+                 font=("Arial", 28, "bold"),
+                 fg="#ffcc00", bg="#000000",
+                 padx=24, pady=14).pack()
+
+        if self.gif_path and os.path.exists(self.gif_path):
+            frames: List[tk.PhotoImage] = []
+            i = 0
+            while True:
+                try:
+                    frames.append(
+                        tk.PhotoImage(file=self.gif_path,
+                                      format=f"gif -index {i}")
+                    )
+                    i += 1
+                except tk.TclError:
+                    break
+            if frames:
+                img = tk.Label(top, bg="#000000")
+                img.pack(padx=20, pady=(0, 10))
+                img.image_refs = frames  # type: ignore[attr-defined]
+
+                def animate(idx: int = 0) -> None:
+                    if not img.winfo_exists():
+                        return
+                    img.configure(image=frames[idx])
+                    top.after(90, animate, (idx + 1) % len(frames))
+
+                animate()
+
+        tk.Button(top, text="OK", command=top.destroy,
+                  bg="#ffcc00", fg="#000000",
+                  font=("Arial", 12, "bold"),
+                  relief="flat", padx=28, pady=6,
+                  activebackground="#ffdd33",
+                  cursor="hand2").pack(pady=(4, 20))
+
+        top.transient(self.root)
+        top.lift()
+        top.attributes("-topmost", True)
+        top.after(200, lambda: top.attributes("-topmost", False))
+        top.update_idletasks()
+        w = top.winfo_width()
+        h = top.winfo_height()
+        sw = top.winfo_screenwidth()
+        sh = top.winfo_screenheight()
+        top.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")

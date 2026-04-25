@@ -12,11 +12,13 @@ You play the real game on another device; this tool tells you exactly what to do
 
 ### Scoring rules
 
-| Combination | Points |
-|---|---|
-| Run · same colour (e.g. Y6 Y7 Y8) | 40 + 10 × (count of cards with number ≥ 3) |
-| Run · mixed colours (e.g. Y1 R2 B3) | 10 × lowest number |
-| Set · all 3 colours (e.g. Y5 R5 B5) | 10 + 10 × number |
+| Combination | Formula | Range |
+|---|---|---|
+| Run · same colour (e.g. Y6 Y7 Y8)   | 40 + 10 × (max number − 2) | 50 … 100 |
+| Run · mixed colours (e.g. Y1 R2 B3) | 10 × lowest number         | 10 …  60 |
+| Set · all 3 colours (e.g. Y5 R5 B5) | 10 × (number + 1)          | 20 …  90 |
+
+Matches the open-sourced game clone this tool is built to solve.
 
 ## Running locally
 

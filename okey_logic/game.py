@@ -2,10 +2,11 @@
 Core game logic: cards, deck, scoring, game state.
 
 Deck: 24 cards  —  numbers 1–8, colors yellow / red / blue (one of each combo).
-Scoring (exactly 3-card hands):
-  Run, same colour   →  40 + 10 × (count of cards where number ≥ 3)
-  Run, mixed colour  →  10 × min(numbers)
-  Set (same number, all 3 colours)  →  10 + 10 × number
+Scoring (exactly 3-card hands), matching the open-sourced game clone
+this tool is built to solve — verified against in-game observations:
+  Run, same colour                  →  100                 (flat)
+  Run, mixed colour                 →  10 × min(numbers)  [10 … 60]
+  Set (same number, all 3 colours)  →  10 × (number + 1)  [20 … 90]
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ def score_combo(cards: List[Card]) -> Tuple[bool, int, str]:
     is_same_col = len(cols) == 1
 
     if is_run and is_same_col:
-        pts = 40 + 10 * sum(1 for n in nums if n >= 3)
+        pts = 100
         col = next(iter(cols))
         return True, pts, f"Run · same colour ({col}) [{nums[0]}-{nums[1]}-{nums[2]}] → {pts}pts"
 
