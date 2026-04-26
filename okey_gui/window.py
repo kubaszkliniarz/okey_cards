@@ -28,7 +28,7 @@ import threading
 import tkinter as tk
 import urllib.request
 from tkinter import font as tkfont
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 from okey_logic.game import Card, COLORS, NUMBERS, score_combo
 from okey_logic.session import SolverSession, ALL_CARDS
@@ -187,7 +187,8 @@ class OkeyApp(tk.Tk):
         self.session = SolverSession()
         self._picker: Dict[Card, PickerCard] = {}
         self._solve_result: Optional[Dict[str, Any]] = None
-        self._highlighted: List[Card] = []
+        self._highlighted: List[Card] = []      # play / keep set (cyan ring)
+        self._drop_target: Optional[Card] = None  # one card to discard (red)
         self._game_over_overlay: Optional[tk.Frame] = None
 
         self._build_ui()
@@ -412,8 +413,12 @@ class OkeyApp(tk.Tk):
     def _draw_hand(self) -> None:
         _clear(self.hand_frame)
         for card in self.session.hand:
-            hl = card in self._highlighted
-            border = HL_RING if hl else SUCCESS
+            if card == self._drop_target:
+                border = ACCENT      # red — this is the card the solver wants gone
+            elif card in self._highlighted:
+                border = HL_RING     # cyan — keep / play
+            else:
+                border = SUCCESS     # default green
             SlotCard(self.hand_frame, card,
                      on_click=self._hand_card_clicked,
                      on_right_click=self._hand_card_discard_one,
@@ -576,7 +581,7 @@ class OkeyApp(tk.Tk):
             list(self.session.remaining_deck),
         )
         self._solve_result = result
-        self._highlighted = _highlight_from(result)
+        self._highlighted, self._drop_target = _highlight_from(result)
         self._draw_hand()
         self._write_solver(result)
 
@@ -635,55 +640,78 @@ class OkeyApp(tk.Tk):
                          font=("Arial", 9), bg=REC_BG,
                          fg=MUTED, wraplength=280,
                          justify="left").pack(anchor="w")
+            # Show why this combo over alternatives (residual EV)
+            future_ev = rec.get("future_ev")
+            total_ev = rec.get("total_ev")
+            if future_ev is not None:
+                tk.Label(inner,
+                         text=f"Residual hand projects {future_ev:.0f} more "
+                              f"pts → total play EV {total_ev:.0f}.",
+                         font=("Arial", 9), bg=REC_BG, fg=MUTED,
+                         wraplength=300,
+                         justify="left").pack(anchor="w", pady=(2, 0))
 
-        elif action == "keep_and_draw":
-            keep = rec.get("keep", [])
-            discard = rec.get("discard", [])
-            n_draw = rec.get("n_draw", 0)
+        elif action == "discard_one":
+            drop = rec["drop"]
+            tk.Label(inner, text="DISCARD THIS ONE CARD",
+                     font=("Arial", 14, "bold"), bg=REC_BG,
+                     fg=WARNING).pack(anchor="w", pady=(4, 2))
+            self._card_row(inner, [drop], highlight=True, bg=REC_BG)
+            tk.Label(inner,
+                     text="Right-click it in your hand to discard, then enter "
+                          "the replacement card you drew.",
+                     font=("Arial", 8, "italic"), bg=REC_BG,
+                     fg=MUTED, wraplength=300,
+                     justify="left").pack(anchor="w", pady=(2, 0))
 
-            if keep:
-                title = f"KEEP {len(keep)}, DISCARD & REDRAW {n_draw}"
-                color = HL_RING
-            else:
-                title = f"DISCARD ALL ({n_draw}), DRAW FRESH"
-                color = WARNING
-            tk.Label(inner, text=title,
-                     font=("Arial", 13, "bold"), bg=REC_BG,
-                     fg=color).pack(anchor="w", pady=(4, 2))
-
-            if keep:
-                tk.Label(inner, text="Keep:",
-                         font=("Arial", 9, "bold"), bg=REC_BG,
-                         fg=FG).pack(anchor="w", pady=(6, 1))
-                self._card_row(inner, keep, highlight=True, bg=REC_BG)
-
-            if discard:
-                tk.Label(inner, text="Discard:",
-                         font=("Arial", 9, "bold"), bg=REC_BG,
-                         fg=MUTED).pack(anchor="w", pady=(6, 1))
-                self._card_row(inner, discard, dim=True, bg=REC_BG)
+            tk.Label(inner, text=f"Keeping ({len(rec.get('keep',[]))}):",
+                     font=("Arial", 9, "bold"), bg=REC_BG,
+                     fg=SUCCESS).pack(anchor="w", pady=(8, 1))
+            self._card_row(inner, rec.get("keep", []),
+                           highlight=True, bg=REC_BG)
 
             need_cards = rec.get("need_cards", [])
             if need_cards:
-                tk.Label(inner, text="Hope to draw:",
+                tk.Label(inner, text="Best draws to hope for:",
                          font=("Arial", 9, "bold"), bg=REC_BG,
                          fg=FG).pack(anchor="w", pady=(6, 1))
                 self._card_row(inner, need_cards[:6], bg=REC_BG)
 
-            p  = rec.get("prob", 0.0)
+            p = rec.get("prob", 0.0)
             ev = rec.get("ev", 0.0)
             stat_color = SUCCESS if p >= 0.5 else WARNING
             tk.Label(inner,
-                     text=f"P = {p:.0%}     EV = {ev:.0f} pts",
+                     text=f"1-step EV = {ev:.0f} pts     "
+                          f"P(any combo on next draw) = {p:.0%}",
                      font=("Arial", 11, "bold"), bg=REC_BG,
                      fg=stat_color).pack(anchor="w", pady=(8, 0))
-
             if "alt_play_score" in rec:
                 tk.Label(inner,
-                         text=f"(or play now for {rec['alt_play_score']} pts guaranteed)",
+                         text=f"(or play {rec['alt_play_score']} pts now)",
                          font=("Arial", 9, "italic"), bg=REC_BG,
-                         fg=WARNING,
-                         wraplength=280, justify="left").pack(anchor="w")
+                         fg=WARNING).pack(anchor="w")
+
+        elif action == "draw_more":
+            missing = rec.get("missing", 0)
+            tk.Label(inner, text=f"DRAW {missing} MORE CARD(S)",
+                     font=("Arial", 14, "bold"), bg=REC_BG,
+                     fg=HL_RING).pack(anchor="w", pady=(4, 2))
+            tk.Label(inner,
+                     text="Your hand isn't full — no discard is needed yet. "
+                          "Just enter the next cards you draw, then re-analyse.",
+                     font=("Arial", 9), bg=REC_BG, fg=FG,
+                     wraplength=300,
+                     justify="left").pack(anchor="w", pady=(2, 0))
+
+        elif action == "keep_and_draw":
+            # Legacy fallback: shouldn't normally hit with new solver
+            keep = rec.get("keep", [])
+            discard = rec.get("discard", [])
+            tk.Label(inner, text="(legacy advice — please refresh)",
+                     font=("Arial", 9, "italic"), bg=REC_BG,
+                     fg=MUTED).pack(anchor="w")
+            if keep:
+                self._card_row(inner, keep, highlight=True, bg=REC_BG)
 
         # Reasoning bullets
         for line in rec.get("reasoning", [])[:4]:
@@ -709,21 +737,19 @@ class OkeyApp(tk.Tk):
                      font=("Arial", 9, "italic"), bg=SOLVER_BG,
                      fg=MUTED).pack(anchor="w", padx=8, pady=(0, 4))
 
-        # ── 3. DISCARD OPTIONS (compare by how many you throw away) ──────────
-        alt_keeps = r.get("alt_keeps", [])
-        if alt_keeps and any(k["n_draw"] > 0 for k in alt_keeps):
-            self._section_header(f, "⇄  DISCARD OPTIONS (by count)")
+        # ── 3. DISCARD ONE CARD (per-card EV ranking) ────────────────────────
+        single_discards = r.get("single_discards", [])
+        if single_discards:
+            self._section_header(f, "⇄  DISCARD ONE CARD (per-card EV)")
             tk.Label(f,
-                     text="Raw EV is what you'd score on average. "
-                          "Adjusted EV penalises burning the deck.",
+                     text="If you discard this card and draw 1 from the deck, "
+                          "what's your expected best combo over the next 1–2 moves?",
                      font=("Arial", 8, "italic"), bg=SOLVER_BG,
                      fg=MUTED, wraplength=310,
                      justify="left").pack(anchor="w", padx=8, pady=(0, 4))
-            best_adj = max(k["adjusted_ev"] for k in alt_keeps)
-            for k in alt_keeps:
-                if k["n_draw"] == 0:
-                    continue
-                self._render_alt_keep(f, k, best_adj)
+            best_ev = single_discards[0]["ev"]
+            for sd in single_discards:
+                self._render_single_discard(f, sd, best_ev)
 
         # ── 4. NEAR COMBOS ────────────────────────────────────────────────────
         self._section_header(f, "◯  NEAR COMBOS (hope to draw)")
@@ -749,6 +775,45 @@ class OkeyApp(tk.Tk):
         tk.Label(parent, text=text,
                  font=("Arial", 10, "bold"), bg=SOLVER_BG,
                  fg=ACCENT).pack(anchor="w", padx=6, pady=(10, 2))
+
+    def _render_single_discard(
+        self, parent: tk.Widget, sd: Dict[str, Any], best_ev: float,
+    ) -> None:
+        """One row in the DISCARD ONE CARD panel: drop, keep, EV, best draw."""
+        is_best = abs(sd["ev"] - best_ev) < 0.5
+
+        sub = tk.Frame(parent, bg=SOLVER_BG)
+        sub.pack(fill="x", padx=6, pady=3, anchor="w")
+
+        head_color = SUCCESS if is_best else FG
+        head = f"Drop {sd['drop']}"
+        if is_best:
+            head += "   ← BEST"
+        tk.Label(sub, text=head,
+                 font=("Arial", 9, "bold"), bg=SOLVER_BG,
+                 fg=head_color).pack(anchor="w")
+
+        row = tk.Frame(sub, bg=SOLVER_BG)
+        row.pack(anchor="w", pady=1)
+        # Show the drop card dimmed (but keeping its colour)
+        MiniCard(row, sd["drop"], dim=True,
+                 bg=SOLVER_BG).pack(side="left", padx=(0, 4))
+        tk.Label(row, text="→  keep", font=("Arial", 8),
+                 bg=SOLVER_BG, fg=MUTED).pack(side="left", padx=(0, 4))
+        for c in sd["keep"]:
+            MiniCard(row, c, highlight=is_best,
+                     bg=SOLVER_BG).pack(side="left", padx=1)
+
+        bo = sd.get("best_outcome")
+        bo_str = ""
+        if bo:
+            be_cards, be_pts, _ = bo
+            bo_str = f"   best draw → {be_pts} pts ({' '.join(str(c) for c in be_cards)})"
+        tk.Label(sub,
+                 text=(f"EV {sd['ev']:.0f}   "
+                       f"P {sd['prob']:.0%}{bo_str}"),
+                 font=("Arial", 8), bg=SOLVER_BG,
+                 fg=SUCCESS if is_best else MUTED).pack(anchor="w")
 
     def _render_alt_keep(self, parent: tk.Widget, k: Dict[str, Any],
                          best_adj: float) -> None:
@@ -951,14 +1016,17 @@ def _sep(parent: tk.Widget) -> None:
     tk.Frame(parent, bg="#2a2a44", height=1).pack(fill="x", pady=4)
 
 
-def _highlight_from(result: Dict[str, Any]) -> List[Card]:
+def _highlight_from(result: Dict[str, Any]) -> Tuple[List[Card], Optional[Card]]:
+    """Returns (highlighted_keep_cards, drop_target_card)."""
     rec    = result.get("recommendation", {})
     action = rec.get("action", "")
     if action == "play":
-        return list(rec.get("cards", []))
+        return list(rec.get("cards", [])), None
+    if action == "discard_one":
+        return list(rec.get("keep", [])), rec.get("drop")
     if action == "keep_and_draw":
-        return list(rec.get("keep", []))
-    return []
+        return list(rec.get("keep", [])), rec.get("first_drop")
+    return [], None
 
 
 # ── Easter egg ────────────────────────────────────────────────────────────────

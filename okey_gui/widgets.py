@@ -161,8 +161,10 @@ class MiniCard(tk.Canvas):
         bg = CARD_COL[self.card.color]
         fg = TEXT_COL[self.card.color]
         if self.dim:
-            bg = "#3a3a4a"
-            fg = "#888888"
+            # Preserve hue so the user can still tell at a glance which
+            # colour the card belongs to — just darken and mute the text.
+            bg = _shift_hex(bg, -0.55)
+            fg = _shift_hex(fg, -0.35) if self.card.color == "yellow" else "#cfcfcf"
 
         border = HL_RING if self.highlight else "#222244"
         bw = 2 if self.highlight else 1

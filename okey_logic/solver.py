@@ -168,9 +168,15 @@ def _analyse_keep_sets(
     hand: List[Card],
     stack: List[Card],
     deck: List[Card],
+    capacity: int,
 ) -> List[Dict[str, Any]]:
     """
-    Every hand-subset to keep, with EV of redrawing the discarded slots.
+    Every hand-subset to keep, with EV of redrawing into all open slots.
+
+    `capacity` is the number of hand slots available (5 − len(stack)).
+    n_draw = capacity − keep_size.  Critically this is *not* len(hand) −
+    keep_size: when the user has only entered 2 cards but their hand can
+    hold 5, refilling will draw 3 — not 0 — fresh cards.
 
     Each entry carries two scores:
       ev           – raw expected best-combo score after the draw
@@ -185,12 +191,14 @@ def _analyse_keep_sets(
     for keep_size in range(0, len(hand) + 1):
         for keep in combinations(hand, keep_size):
             keep_list = list(keep)
-            n_draw = len(hand) - keep_size
-            info = _ev_keep_and_redraw(keep_list, stack, deck, n_draw)
             discard = [c for c in hand if c not in keep_list]
+            # Cards we'll draw from the deck = open slots after keeping.
+            n_draw = max(0, capacity - keep_size)
+            info = _ev_keep_and_redraw(keep_list, stack, deck, n_draw)
             entry = {
                 "keep": keep_list,
                 "discard": discard,
+                "n_discard": len(discard),
                 "n_draw": n_draw,
                 "ev": info["ev"],
                 "prob": info["prob"],
@@ -274,142 +282,409 @@ def _helpful_completers(
 
 # ── Main solver entry point ───────────────────────────────────────────────────
 
+HAND_CAPACITY_DEFAULT = 5  # 5 hand slots in the reference game
+
+
 def solve(
     hand: List[Card],
     stack: List[Card],
     deck: List[Card],
+    capacity: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Analyse current position and return a structured recommendation."""
+    """
+    Analyse current position and return a structured recommendation.
+
+    `capacity` is the number of hand slots available right now
+    (HAND_CAPACITY_DEFAULT − len(stack)).  When the user has only partly
+    filled their hand (e.g. they've only entered 2 cards out of 5), this
+    is what tells the solver "you'll be drawing 3 more cards into those
+    empty slots".  Defaults to MAX_VISIBLE − len(stack) which matches the
+    real game.
+    """
     all_cards = hand + stack
+    if capacity is None:
+        capacity = HAND_CAPACITY_DEFAULT - len(stack)
+    capacity = max(capacity, len(hand))   # never below current hand size
 
     immediate = _all_combos_in(all_cards)
     near = _analyse_pairs(all_cards, hand, deck)
-    keep_sets = _analyse_keep_sets(hand, stack, deck)
+    keep_sets = _analyse_keep_sets(hand, stack, deck, capacity)
+
+    # Per-card single-discard EV — the action space the game actually
+    # supports ("drop one card, draw one card").  Used both to rank discards
+    # and to compare against playing a combo right now.
+    short_hand = len(hand) < capacity
+    single_discards: List[Dict[str, Any]] = []
+    if hand and not short_hand:
+        single_discards = _rank_single_discards(hand, stack, deck)
+
+    # Per-combo play evaluation — total EV is "points scored now" plus the
+    # expected best follow-up from the residual hand once the play refills
+    # the empty slots.  This is what lets us prefer Play(R3) over Play(B3)
+    # when both score 10 but B3 has more 100-pt completers still in deck.
+    play_options: List[Dict[str, Any]] = []
+    capacity_after_play = HAND_CAPACITY_DEFAULT  # stack empties after a play
+    for combo in immediate:
+        play_options.append(
+            _eval_play(combo, hand, stack, deck, capacity_after_play)
+        )
+    play_options.sort(key=lambda p: -p["total_ev"])
+
+    # Group alternatives by *cards-discarded-from-hand* (n_discard, what the
+    # user actually clicks).  n_draw lives separately — it's whatever empty
+    # slots remain after the discards, including pre-existing empties.
+    alt_by_size: Dict[int, Dict[str, Any]] = {}
+    for k in keep_sets:
+        nd = k["n_discard"]
+        if nd not in alt_by_size or k["adjusted_ev"] > alt_by_size[nd]["adjusted_ev"]:
+            alt_by_size[nd] = k
+    alt_keeps = [alt_by_size[nd] for nd in sorted(alt_by_size.keys())]
 
     # Fresh-draw baseline = keep-set with empty keep
     fresh_rec = next((k for k in keep_sets if len(k["keep"]) == 0), None)
     fresh_ev = fresh_rec["ev"] if fresh_rec else 0.0
 
-    # Alternatives to show the user: the best keep-subset per n_draw size.
-    # That way they see what happens if they discard 1, 2, 3, etc. — not
-    # just the overall winner.
-    alt_by_size: Dict[int, Dict[str, Any]] = {}
-    for k in keep_sets:
-        nd = k["n_draw"]
-        if nd not in alt_by_size or k["adjusted_ev"] > alt_by_size[nd]["adjusted_ev"]:
-            alt_by_size[nd] = k
-    alt_keeps = [alt_by_size[nd] for nd in sorted(alt_by_size.keys())]
-
     rec = _make_recommendation(
-        immediate, keep_sets, near, fresh_ev, hand, stack, deck
+        immediate, play_options, single_discards, keep_sets,
+        near, fresh_ev, hand, stack, deck, capacity, short_hand,
     )
 
     return {
         "immediate_combos": immediate,
+        "play_options": play_options,
+        "single_discards": single_discards,
         "near_combos": near[:6],
         "keep_sets": keep_sets[:8],
         "alt_keeps": alt_keeps,
         "fresh_ev": fresh_ev,
+        "capacity": capacity,
+        "short_hand": short_hand,
         "recommendation": rec,
     }
 
 
+def _ev_after_single_discard(
+    drop: Card,
+    hand: List[Card],
+    stack: List[Card],
+    deck: List[Card],
+    lookahead: int = 2,
+) -> Dict[str, Any]:
+    """
+    EV of the atomic move "discard *drop* and draw exactly one card",
+    averaged over every possible drawn card.  By default uses 2-step
+    lookahead — important because some keeps (e.g. holding 4 same-colour
+    cards) gain most of their value over CHAINS of subsequent draws, not
+    in a single turn.
+
+    The 1-step term counts: if we land an immediate combo, take its score.
+    The 2-step term: if the first draw doesn't complete anything, simulate
+    the optimal next single-discard and average over its possible draws.
+
+    Returns ev / prob / best_outcome / hit_count.
+    """
+    keep = [c for c in hand if c is not drop]
+    base = keep + list(stack)
+    if not deck:
+        b = _best_combo_in(base)
+        return {
+            "drop": drop, "keep": keep,
+            "ev": float(b[1]) if b else 0.0,
+            "prob": 1.0 if b else 0.0,
+            "best_outcome": b,
+            "hit_count": 1 if b else 0,
+            "deck_size": 0,
+        }
+
+    total = 0.0
+    hits = 0
+    best_outcome: Optional[Tuple[List[Card], int, str]] = None
+    for d in deck:
+        new_pool = base + [d]
+        b = _best_combo_in(new_pool)
+        if b:
+            total += b[1]
+            hits += 1
+            if best_outcome is None or b[1] > best_outcome[1]:
+                best_outcome = b
+            continue
+        # No immediate combo — extend horizon by one more step if asked.
+        if lookahead > 1:
+            new_hand = keep + [d]
+            new_deck = [c for c in deck if c is not d]
+            if not new_deck:
+                continue
+            # Greedy: pick the best second discard from the new hand.
+            best_step2 = 0.0
+            for y in new_hand:
+                sub_keep = [c for c in new_hand if c is not y]
+                sub_pool = sub_keep + list(stack)
+                sub_total = 0.0
+                for d2 in new_deck:
+                    b2 = _best_combo_in(sub_pool + [d2])
+                    if b2:
+                        sub_total += b2[1]
+                ev_y = sub_total / len(new_deck)
+                if ev_y > best_step2:
+                    best_step2 = ev_y
+            total += best_step2
+    n = len(deck)
+    return {
+        "drop": drop, "keep": keep,
+        "ev": total / n,
+        "prob": hits / n,
+        "best_outcome": best_outcome,
+        "hit_count": hits,
+        "deck_size": n,
+    }
+
+
+def _rank_single_discards(
+    hand: List[Card],
+    stack: List[Card],
+    deck: List[Card],
+) -> List[Dict[str, Any]]:
+    """One entry per hand card, sorted best-to-worst by 1-step EV."""
+    if not hand:
+        return []
+    return sorted(
+        (_ev_after_single_discard(c, hand, stack, deck) for c in hand),
+        key=lambda r: -r["ev"],
+    )
+
+
+def _eval_play(
+    combo: Tuple[List[Card], int, str],
+    hand: List[Card],
+    stack: List[Card],
+    deck: List[Card],
+    capacity_after_play: int,
+) -> Dict[str, Any]:
+    """
+    Total EV of playing this combo:  score_now + E[best combo achievable
+    from the residual hand once 3 (or fewer at end-of-deck) refill cards
+    are drawn].
+
+    This is what makes the solver pick the *right* combo when several share
+    the same point value — e.g. when [Y1,Y2,B3] and [Y1,Y2,R3] both score
+    10, we want the one that leaves the higher-EV card behind in hand.
+    """
+    cards, pts, desc = combo
+    new_hand = [c for c in hand if c not in cards]
+    new_stack = [c for c in stack if c not in cards]
+    open_slots = capacity_after_play - len(new_hand)
+    n_draw = max(0, min(open_slots, len(deck)))
+
+    if n_draw == 0 or not deck:
+        b = _best_combo_in(new_hand + new_stack)
+        future = float(b[1]) if b else 0.0
+    else:
+        space = comb(len(deck), n_draw)
+        if space <= EXACT_THRESHOLD:
+            total = 0.0
+            for sample in combinations(deck, n_draw):
+                b = _best_combo_in(new_hand + new_stack + list(sample))
+                total += b[1] if b else 0.0
+            future = total / space
+        else:
+            total = 0.0
+            for _ in range(MC_TRIALS):
+                sample = random.sample(deck, n_draw)
+                b = _best_combo_in(new_hand + new_stack + sample)
+                total += b[1] if b else 0.0
+            future = total / MC_TRIALS
+
+    return {
+        "combo": combo,
+        "score": pts,
+        "desc": desc,
+        "future_ev": future,
+        "total_ev": pts + future,
+        "residual": new_hand,
+    }
+
+
+def _pick_first_to_drop(
+    hand: List[Card],
+    keep: List[Card],
+    discard: List[Card],
+    stack: List[Card],
+    deck: List[Card],
+    capacity: int,
+) -> Optional[Card]:
+    """
+    Of the cards we plan to throw away, which single one should the user
+    discard *first*?  Pick the candidate whose true 1-step EV is highest —
+    that's the move that maximises this turn's outcome.  If no draw is
+    possible the answer is trivially the first item.
+    """
+    if not discard:
+        return None
+    if len(discard) == 1:
+        return discard[0]
+    if not deck:
+        return discard[0]
+
+    best: Optional[Card] = None
+    best_ev = -1.0
+    for c in discard:
+        info = _ev_after_single_discard(c, hand, stack, deck)
+        if info["ev"] > best_ev:
+            best_ev = info["ev"]
+            best = c
+    return best or discard[0]
+
+
 def _make_recommendation(
     immediate: List[Tuple[List[Card], int, str]],
+    play_options: List[Dict[str, Any]],
+    single_discards: List[Dict[str, Any]],
     keep_sets: List[Dict[str, Any]],
     near: List[Dict[str, Any]],
     fresh_ev: float,
     hand: List[Card],
     stack: List[Card],
     deck: List[Card],
+    capacity: int,
+    short_hand: bool,
 ) -> Dict[str, Any]:
+    """
+    Build a single-atomic-action recommendation that matches how the game
+    is actually played: at any moment the user either plays a 3-card combo
+    or discards exactly ONE card (which triggers exactly one redraw).  The
+    longer-term plan ("eventually you'll drop these N cards") is shown as
+    context, not as the headline action.
+    """
     reasoning: List[str] = []
 
-    best_imm = immediate[0] if immediate else None
+    # ── 0. Hand not yet full — wait for more cards ───────────────────────────
+    if short_hand:
+        missing = capacity - len(hand)
+        reasoning.append(
+            f"Your hand is {len(hand)}/{capacity}; the game will deal "
+            f"{missing} more before you face any decision."
+        )
+        if hand:
+            same_col_pair_count = sum(
+                1 for a, b in combinations(hand, 2)
+                if a.color == b.color and abs(a.number - b.number) <= 2
+            )
+            if same_col_pair_count:
+                reasoning.append(
+                    f"You already have {same_col_pair_count} same-colour "
+                    f"close pair(s) in hand — strong start, those can target 100-pt runs."
+                )
+        reasoning.append(
+            "Enter the rest using the picker.  No discard is required yet."
+        )
+        return {
+            "action": "draw_more",
+            "missing": missing,
+            "reasoning": reasoning,
+        }
 
-    # Best actionable keep-set (must actually do something: n_draw > 0).
-    # keep_sets is already sorted by adjusted_ev so [0] is the strategic best.
-    actionable = [k for k in keep_sets if k["n_draw"] > 0]
+    # Best play (by total EV including residual), best single-discard.
+    best_play = play_options[0] if play_options else None
+    best_disc = single_discards[0] if single_discards else None
+
+    # keep_sets is sorted by adjusted_ev so [0] is the strategic best.
+    actionable = [k for k in keep_sets if k["n_discard"] > 0 or k["n_draw"] > 0]
     best_keep = actionable[0] if actionable else None
 
-    # The discard-all option, specifically, for comparison framing.
-    discard_all = next(
-        (k for k in keep_sets if k["n_draw"] == len(hand) and len(hand) > 0),
-        None,
-    )
+    # ── A. Valid combo available — play vs continue, with residual EV ────────
+    if best_play:
+        cards = best_play["combo"][0]
+        score = best_play["score"]
+        desc = best_play["desc"]
+        residual = best_play["residual"]
+        future = best_play["future_ev"]
+        play_total = best_play["total_ev"]
 
-    # ── A. Valid combo available ─────────────────────────────────────────────
-    if best_imm:
-        cards, score, desc = best_imm
-        reasoning.append(f"Valid combo ready: {desc}")
+        reasoning.append(
+            f"Best playable combo: {desc} for +{score} pts."
+        )
+        if residual:
+            reasoning.append(
+                f"Leaves {[str(c) for c in residual]} in hand; that residual "
+                f"projects {future:.0f} pts on the next move (EV total {play_total:.0f})."
+            )
+        # Mention the runner-up if it's a tie on score but different residual
+        if len(play_options) > 1:
+            second = play_options[1]
+            if second["score"] == score and second["combo"][0] != cards:
+                reasoning.append(
+                    f"(Runner-up {second['combo'][2]} would leave "
+                    f"{[str(c) for c in second['residual']]}; future EV "
+                    f"{second['future_ev']:.0f} → total {second['total_ev']:.0f}.)"
+                )
 
-        # Only wait if the deck-adjusted EV beats the certain score with room
-        # to spare — the penalty already accounts for burned deck slots.
+        # Skip the play only if continuing has clearly higher EV.
+        continue_ev = best_disc["ev"] if best_disc else 0.0
         if (
-            best_keep
-            and best_keep["adjusted_ev"] > score + 5
-            and best_keep["prob"] >= 0.5
+            best_disc
+            and continue_ev > play_total + 10
             and len(deck) >= 6
         ):
             reasoning.append(
-                f"Holding {[str(c) for c in best_keep['keep']]} "
-                f"(discard {best_keep['n_draw']}) has deck-adjusted EV "
-                f"{best_keep['adjusted_ev']:.0f} vs {score} certain — "
-                f"worth the gamble."
+                f"However discarding {best_disc['drop']} (1-step EV "
+                f"{continue_ev:.0f}) clearly beats playing now — wait."
             )
-            return _build_keep_rec(
-                best_keep, deck, reasoning, alt_play_score=score
-            )
+            return _build_discard_rec(best_disc, deck, reasoning,
+                                       alt_play_score=score)
 
-        reasoning.append("Play it now for a certain score.")
+        reasoning.append("Play it now for the certain score.")
         return {
             "action": "play",
             "cards": cards,
             "score": score,
             "desc": desc,
+            "future_ev": future,
+            "total_ev": play_total,
+            "residual": residual,
             "reasoning": reasoning,
         }
 
-    # ── B. No immediate combo — pick best keep-set ───────────────────────────
-    if best_keep:
-        keep_size = len(best_keep["keep"])
+    # ── B. No immediate combo — pick the SINGLE best card to discard ────────
+    if best_disc:
         reasoning.append(
-            f"Keep {keep_size} card(s), discard {best_keep['n_draw']}, "
-            f"redraw {best_keep['n_draw']}."
+            f"No combo playable right now.  Discard {best_disc['drop']} — "
+            f"that gives the highest 1-step EV ({best_disc['ev']:.0f})."
         )
-        if best_keep["best_expected"]:
-            be_cards, be_score, _ = best_keep["best_expected"]
+        if best_disc["best_outcome"]:
+            be_cards, be_score, _ = best_disc["best_outcome"]
             reasoning.append(
-                f"If it lands: {[str(c) for c in be_cards]} → {be_score} pts."
+                f"Best draw outcome: {[str(c) for c in be_cards]} → {be_score} pts."
             )
-        reasoning.append(
-            f"EV {best_keep['ev']:.0f}  "
-            f"P(any combo) {best_keep['prob']:.0%}  "
-            f"(fresh-draw baseline {fresh_ev:.0f})."
-        )
-
-        # If discard-all's raw EV is higher but it lost on deck-adjusted EV,
-        # call that out so the user understands the trade-off.
-        if (
-            discard_all
-            and discard_all is not best_keep
-            and discard_all["ev"] > best_keep["ev"]
-        ):
+        # Show why this beats the alternatives
+        if len(single_discards) > 1:
+            others = single_discards[1:3]
+            descs = ", ".join(
+                f"{o['drop']} (EV {o['ev']:.0f})" for o in others
+            )
+            reasoning.append(f"Next-best alternatives: {descs}.")
+        # Surface the long-term plan from keep-set analysis as context only
+        if best_keep and best_keep["keep"]:
             reasoning.append(
-                f"Discarding all 5 has raw EV {discard_all['ev']:.0f} but "
-                f"burns the deck faster — keeping is the higher-yield play."
+                f"Long-term target: keep {[str(c) for c in best_keep['keep']]} "
+                f"toward {_describe_keep_target(best_keep)}."
             )
-        return _build_keep_rec(best_keep, deck, reasoning)
+        return _build_discard_rec(best_disc, deck, reasoning)
 
     # ── C. Fallback ──────────────────────────────────────────────────────────
-    reasoning.append("Nothing worth keeping; discard everything.")
+    reasoning.append(
+        f"Nothing useful in hand yet — enter the {capacity - len(hand)} "
+        f"card(s) you'll draw using the picker."
+    )
     return {
         "action": "keep_and_draw",
         "keep": [],
         "discard": list(hand),
-        "n_draw": len(hand),
+        "n_discard": len(hand),
+        "n_draw": capacity - 0,
+        "first_drop": None,
         "prob": 0.0,
         "ev": fresh_ev,
+        "adjusted_ev": fresh_ev,
         "need_cards": [],
         "need_examples": [],
         "best_expected": None,
@@ -417,16 +692,63 @@ def _make_recommendation(
     }
 
 
+def _build_discard_rec(
+    disc_info: Dict[str, Any],
+    deck: List[Card],
+    reasoning: List[str],
+    alt_play_score: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Build a single-discard recommendation.  This is the canonical "atomic"
+    move the game supports: discard one card, draw one.
+    """
+    drop = disc_info["drop"]
+    keep = disc_info["keep"]
+
+    # Show what we'd hope to draw — the cards in the deck that maximise
+    # our best combo if drawn next.
+    helpful = _helpful_completers(keep, deck)
+    need_cards = [c for c, _ in helpful[:6]]
+
+    rec = {
+        "action": "discard_one",
+        "discard": [drop],
+        "drop": drop,
+        "keep": keep,
+        "ev": disc_info["ev"],
+        "prob": disc_info["prob"],
+        "best_outcome": disc_info["best_outcome"],
+        "hit_count": disc_info["hit_count"],
+        "deck_size": disc_info["deck_size"],
+        "need_cards": need_cards,
+        "need_examples": [str(c) for c in need_cards[:3]],
+        "reasoning": reasoning,
+    }
+    if alt_play_score is not None:
+        rec["alt_play_score"] = alt_play_score
+    return rec
+
+
+def _describe_keep_target(keep_info: Dict[str, Any]) -> str:
+    """Short text describing what combo a keep-set is aiming at."""
+    be = keep_info.get("best_expected")
+    if be:
+        cards, pts, _ = be
+        return f"{[str(c) for c in cards]} ({pts} pts)"
+    return "future combo opportunities"
+
+
 def _build_keep_rec(
     keep_info: Dict[str, Any],
     deck: List[Card],
     reasoning: List[str],
+    capacity: int,
+    first_drop: Optional[Card] = None,
     alt_play_score: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build a keep_and_draw recommendation with need-card info for display."""
     keep_cards = keep_info["keep"]
     need_cards: List[Card] = []
-    need_examples: List[str] = []
 
     # For a kept pair, known completers are exact.  Otherwise use helpful_completers.
     if len(keep_cards) == 2 and keep_info["n_draw"] > 0:
@@ -446,9 +768,12 @@ def _build_keep_rec(
         "action": "keep_and_draw",
         "keep": keep_cards,
         "discard": keep_info["discard"],
+        "n_discard": keep_info["n_discard"],
         "n_draw": keep_info["n_draw"],
+        "first_drop": first_drop,
         "prob": keep_info["prob"],
         "ev": keep_info["ev"],
+        "adjusted_ev": keep_info["adjusted_ev"],
         "best_expected": keep_info["best_expected"],
         "need_cards": need_cards,
         "need_examples": need_examples,
