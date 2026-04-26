@@ -3,6 +3,17 @@
 A strategy advisor for the Okey card mini-game (as found in Metin2 and similar games).
 You play the real game on another device; this tool tells you exactly what to do.
 
+## Download
+
+Pre-built binaries for the latest tagged release:
+
+→ **[Releases page](https://github.com/kubaszkliniarz/okey_cards/releases/latest)**
+
+- **Windows**: download `OkeyCardGame.exe` and double-click.
+- **macOS**: download `OkeyCardGame-macOS.zip`, unzip, then right-click → Open the first time (Gatekeeper).
+
+No Python install required.
+
 ## How it works
 
 - Use the **card picker grid** to enter the 5 cards you currently see in the real game
@@ -39,16 +50,24 @@ pip install pyinstaller
 
 ### Windows (.exe) — built automatically via GitHub Actions
 
-1. Push this repo to GitHub
-2. Go to **Actions → Build Windows EXE → Run workflow**
-3. Download `OkeyCardGame.exe` from the **Artifacts** section
-
 Or on a Windows machine directly:
 ```bat
 pip install pyinstaller
 build_exe.bat
 rem → dist\OkeyCardGame.exe
 ```
+
+### Cutting a public release (maintainer)
+
+GitHub Actions will build .exe + macOS .zip and attach them to a Release on
+every `v*` tag push:
+
+```bash
+git tag v0.2.0
+git push --tags
+```
+
+A new entry then appears under [Releases](https://github.com/kubaszkliniarz/okey_cards/releases) with both binaries downloadable by anyone.
 
 ## Project structure
 
@@ -63,7 +82,8 @@ okey_gui/
 main.py        Entry point
 .github/
   workflows/
-    build-exe.yml   CI: builds Windows .exe on every push to main
+    build-exe.yml   CI: builds Windows .exe on push; attaches to Release on tag
+    build-mac.yml   CI: builds macOS app on tag; attaches to Release
 pyproject.toml      Project metadata and tool config
 build_mac.sh        macOS build script
 build_exe.bat       Windows build script

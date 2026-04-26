@@ -1,0 +1,57 @@
+name: Build macOS App
+
+on:
+  push:
+    tags: ["v*"]            # tag push (e.g. v0.2.0) → publishes a Release
+  workflow_dispatch:
+
+permissions:
+  contents: write           # required to create / update Releases
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build .app
+        run: |
+          pyinstaller --onefile --windowed --name OkeyCardGame \
+            --add-data "okey_logic:okey_logic" \
+            --add-data "okey_gui:okey_gui" \
+            main.py
+
+      - name: Package .app into a .zip
+        run: |
+          cd dist
+          # PyInstaller produces both OkeyCardGame (binary) and OkeyCardGame.app
+          # Zip the .app so it survives upload (macOS bundles are directories)
+          if [ -d OkeyCardGame.app ]; then
+            zip -r OkeyCardGame-macOS.zip OkeyCardGame.app
+          else
+            zip OkeyCardGame-macOS.zip OkeyCardGame
+          fi
+
+      - name: Upload as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OkeyCardGame-macOS
+          path: dist/OkeyCardGame-macOS.zip
+          retention-days: 30
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/OkeyCardGame-macOS.zip
+          generate_release_notes: true
